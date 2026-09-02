@@ -1,11 +1,10 @@
 """Caribbean Airlines (BWA) flight tracker — dedicated dispatch-office display.
 
-Combines live ADS-B data (community aggregator: adsb.lol/adsb.fi) with
-Caribbean Airlines' own flight-status data (looked up per airborne flight
-number) into a single large-format table meant for an unattended wall/
-office monitor. Auto-refreshes the page every REFRESH_SECONDS. See
-flights.py for why this only covers flights that have already departed
-(ADS-B discoverable) or are on the watchlist, not the full day's schedule.
+Combines live ADS-B data (community aggregator: adsb.lol/adsb.fi), CAL's
+own published schedule (to find flight numbers ADS-B might miss), and
+CAL's live flight-status data into a single large-format table meant for
+an unattended wall/office monitor. Auto-refreshes every REFRESH_SECONDS.
+See flights.py for the full picture of how these three sources combine.
 """
 
 import html
@@ -15,10 +14,12 @@ import pandas as pd
 import streamlit as st
 
 from flights import (
+    active_scheduled_flight_numbers,
     airborne_flight_numbers,
     build_flight_table,
     fetch_caribbean_status,
     fetch_live_positions,
+    fetch_schedule_roster,
     sticky_candidates,
     update_active_registry,
     watchlist_flight_numbers,
@@ -118,7 +119,7 @@ def main():
     st.title("✈️ Caribbean Airlines Flight Tracker")
     st.markdown(
         '<div class="subtitle">Callsign BWA · Live position via community ADS-B feed · '
-        "Schedule/status via Caribbean Airlines</div>",
+        "Schedule &amp; status via Caribbean Airlines</div>",
         unsafe_allow_html=True,
     )
 
@@ -128,9 +129,14 @@ def main():
         st.error(f"Failed to fetch live position data: {exc}")
         positions_df = pd.DataFrame()
 
-    flight_numbers = sticky_candidates(
-        airborne_flight_numbers(positions_df), watchlist_flight_numbers()
-    )
+    try:
+        roster = fetch_schedule_roster()
+    except Exception as exc:
+        st.error(f"Failed to fetch Caribbean Airlines schedule: {exc}")
+        roster = []
+
+    discovered = set(airborne_flight_numbers(positions_df)) | set(active_scheduled_flight_numbers(roster))
+    flight_numbers = sticky_candidates(tuple(sorted(discovered)), watchlist_flight_numbers())
 
     cal_df = pd.DataFrame()
     rate_limited = False

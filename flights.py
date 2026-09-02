@@ -1,27 +1,43 @@
 """Data fetching and merge logic for tracking Caribbean Airlines (BWA) flights.
 
-Two data sources are combined, matched by ICAO callsign:
-  - A community ADS-B aggregator (adsb.lol, falling back to adsb.fi): live
+Three data sources are combined, matched by ICAO callsign/flight number:
+  - A community ADS-B aggregator (adsb.lol and adsb.fi, unioned): live
     position, on-ground status, and which BWA flight numbers are currently
     airborne (no schedule data). OpenSky Network was tried first but its
     anonymous API blocks/times-out traffic from major cloud-hosting IP
     ranges (confirmed by testing) — including Streamlit Community Cloud,
     which runs on GCP — so it's unusable once actually deployed there.
     adsb.lol/adsb.fi are community projects built for exactly this kind of
-    open, bulk, no-registration consumption and don't have that problem.
+    open, bulk, no-registration consumption and don't have that problem,
+    but their crowdsourced coverage still has real gaps (also confirmed by
+    testing: cross-checking against OpenSky, and even against CAL's own
+    live-status feed, both adsb.lol and adsb.fi individually and combined
+    have missed real, currently-airborne BWA flights).
   - Caribbean Airlines' own internal flight-status endpoint (undocumented,
     used by caribbean-airlines.com's own "Flight Status" page): scheduled
     times, actual/estimated departure & arrival, and flight status, looked
-    up per flight number.
+    up per flight number. Rate-limited/WAF-protected (found by testing:
+    bulk/rapid querying returns HTTP 429), so it's NOT safe to scan the
+    full route network on this endpoint — only a small, paced, per-flight
+    lookup is used.
+  - Caribbean Airlines' own published timetable endpoint (also
+    undocumented, used by their "Flight Schedule" page) — a *different*
+    endpoint from the live-status one above, and NOT similarly rate-
+    limited (confirmed by testing: querying it for all 25 origin airports
+    back-to-back succeeded without issue). This is the fix for ADS-B's
+    coverage gaps: rather than relying on ADS-B to discover which flight
+    numbers exist, this fetches CAL's actual published schedule (cached
+    for hours, since schedules don't change intraday) and computes which
+    flight numbers are plausibly operating right now from their day-of-
+    week/time-of-day pattern, then checks those directly regardless of
+    what ADS-B does or doesn't detect.
 
-This app only queries CAL's endpoint for flight numbers already confirmed
-airborne. That endpoint is rate-limited/WAF-protected (found by testing:
-bulk/rapid querying returns HTTP 429), so it is NOT safe to scan the full
-route network to build a complete schedule — only a small, paced,
-per-flight lookup is used. Consequence: a flight that hasn't departed yet
-(not visible on ADS-B) won't appear here until wheels-up.
+Consequence of what's left after all three: a flight that's genuinely not
+in CAL's published schedule at all (e.g. a one-off charter) still won't
+appear until ADS-B spots it or it's added to the watchlist.
 """
 
+import random
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -30,6 +46,32 @@ import requests
 import streamlit as st
 
 CAL_STATUS_URL = "https://www.caribbean-airlines.com/get/Flight/Status"
+CAL_SCHEDULE_URL_TEMPLATE = "https://www.caribbean-airlines.com/api/schedule/{origin}/NONE/{month_year}"
+
+# Every origin airport in CAL's network (from api/Flight/Getroutesflights).
+# Needed because return legs (e.g. BW483 MIA->POS) originate from the spoke
+# city, not the hub, and querying only POS/KIN's schedule would miss them.
+CAL_SCHEDULE_ORIGINS = [
+    "ANU", "BGI", "CCS", "CUR", "FDF", "FLL", "GEO", "GND", "HAV", "JFK",
+    "KIN", "MCO", "MIA", "NAS", "OGL", "ORY", "PBM", "POS", "PTP", "SFG",
+    "SLU", "SVD", "SXM", "TAB", "YYZ",
+]
+CAL_SCHEDULE_TTL_SECONDS = 6 * 60 * 60  # schedules don't change intraday
+CAL_SCHEDULE_REQUEST_DELAY_SECONDS = 1.0
+
+# Rough UTC offsets (hours) for the airports above, only used to estimate
+# whether a scheduled local time is plausibly "now" — not shown to users,
+# so DST edge cases costing an hour of accuracy here don't matter.
+AIRPORT_UTC_OFFSET_HOURS = {
+    "POS": -4, "BGI": -4, "GND": -4, "SLU": -4, "SVD": -4, "ANU": -4,
+    "PTP": -4, "FDF": -4, "SXM": -4, "SFG": -4, "TAB": -4, "CUR": -4,
+    "GEO": -4, "OGL": -4, "CCS": -4, "HAV": -4, "NAS": -4,
+    "MIA": -4, "FLL": -4, "MCO": -4, "JFK": -4, "YYZ": -4,
+    "PBM": -3, "KIN": -5, "ORY": 2,
+}
+SCHEDULE_PRE_DEPARTURE_BUFFER_MIN = 45
+SCHEDULE_POST_ARRIVAL_BUFFER_MIN = 180
+_WEEKDAY_KEYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 # Point+radius queries against community ADS-B aggregators (readsb/tar1090
 # API family). Centered on Piarco (POS), Caribbean Airlines' main hub, with
@@ -47,7 +89,13 @@ ADSB_QUERY_RADIUS_NM = 4000
 CALLSIGN_PREFIX = "BWA"  # Caribbean Airlines ICAO code
 OVERDUE_THRESHOLD_MINUTES = 30
 CAL_REQUEST_DELAY_SECONDS = 1.5  # pacing between new (non-cached) per-flight lookups
-CAL_CACHE_TTL_SECONDS = 600  # matches the page's 10-min auto-refresh cadence
+# Deliberately longer than the 10-min refresh cadence: with the schedule
+# roster now feeding in ~15-20 candidates at once, a TTL equal to the
+# refresh interval makes every cycle's cache entries expire in lockstep,
+# forcing a full ~20-request burst every single cycle -- which is exactly
+# what tripped CAL's rate limiter in testing. A longer TTL staggers
+# expiry so only a fraction need a fresh fetch on any given cycle.
+CAL_CACHE_TTL_SECONDS = 20 * 60
 STICKY_GRACE_SECONDS = 20 * 60  # keep a confirmed-active flight in the candidate set this long after its last confirmation, riding out ADS-B/CAL blind spots
 TERMINAL_STATUSES = {"cancelled", "landed"}
 
@@ -108,6 +156,103 @@ def _parse_iso(value):
         return pd.to_datetime(value, utc=True).to_pydatetime()
     except (ValueError, TypeError):
         return None
+
+
+def _parse_date_only(value):
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return None
+
+
+def _parse_local_clock_time_to_utc(date_obj, time_str: str, utc_offset_hours: float):
+    """Combine a date with a 'HH:MM AM/PM' local-time string and a UTC
+    offset into a UTC datetime, or None if time_str can't be parsed."""
+    try:
+        t = datetime.strptime((time_str or "").strip(), "%I:%M %p")
+    except ValueError:
+        return None
+    local_dt = datetime(date_obj.year, date_obj.month, date_obj.day, t.hour, t.minute, tzinfo=timezone.utc)
+    return local_dt - timedelta(hours=utc_offset_hours)
+
+
+@st.cache_data(ttl=CAL_SCHEDULE_TTL_SECONDS, show_spinner=False)
+def fetch_schedule_roster() -> list:
+    """Caribbean Airlines' own published timetable, fetched once per origin
+    airport (25 requests) and cached for hours since schedules don't change
+    intraday. A single origin failing doesn't block the others — this just
+    ends up with a slightly less complete roster until the next refetch.
+    """
+    now = _now_utc()
+    month_year = now.strftime("%b %Y")
+    entries = []
+    for i, origin in enumerate(CAL_SCHEDULE_ORIGINS):
+        if i > 0:
+            time.sleep(CAL_SCHEDULE_REQUEST_DELAY_SECONDS)
+        try:
+            resp = requests.get(
+                CAL_SCHEDULE_URL_TEMPLATE.format(origin=origin, month_year=month_year.replace(" ", "%20")),
+                headers=CAL_HEADERS,
+                timeout=15,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+        except Exception:
+            continue
+        entries.extend(payload.get("schedule") or [])
+    return entries
+
+
+def active_scheduled_flight_numbers(roster: list) -> tuple:
+    """Flight numbers from the schedule roster whose scheduled window
+    (departure minus a pre-departure buffer, through arrival plus a
+    post-arrival buffer) plausibly includes right now, accounting for each
+    entry's day-of-week pattern and validity date range."""
+    now = _now_utc()
+    active = set()
+
+    for entry in roster:
+        flight_num = (entry.get("flight_num") or "").strip().upper()
+        if not flight_num.startswith("BW"):
+            continue
+        number = flight_num[2:].strip()
+        if not number:
+            continue
+
+        start_date = _parse_date_only(entry.get("start_date"))
+        end_date = _parse_date_only(entry.get("end_date"))
+        frequency = entry.get("frequency") or {}
+        offset = AIRPORT_UTC_OFFSET_HOURS.get(entry.get("from_code"), -4)
+
+        # Check today, yesterday, and tomorrow at the origin's local date,
+        # since the entry's day-of-week is local and a window can straddle
+        # a UTC/local date boundary.
+        local_today = (now + timedelta(hours=offset)).date()
+        for day_delta in (0, -1, 1):
+            candidate_date = local_today + timedelta(days=day_delta)
+            if start_date and candidate_date < start_date:
+                continue
+            if end_date and candidate_date > end_date:
+                continue
+            if not frequency.get(_WEEKDAY_KEYS[candidate_date.weekday()]):
+                continue
+
+            dep_utc = _parse_local_clock_time_to_utc(candidate_date, entry.get("departure_time"), offset)
+            arr_utc = _parse_local_clock_time_to_utc(candidate_date, entry.get("arrival_time"), offset)
+            if dep_utc is None or arr_utc is None:
+                continue
+            if arr_utc < dep_utc:
+                arr_utc += timedelta(days=1)  # overnight flight
+
+            window_start = dep_utc - timedelta(minutes=SCHEDULE_PRE_DEPARTURE_BUFFER_MIN)
+            window_end = arr_utc + timedelta(minutes=SCHEDULE_POST_ARRIVAL_BUFFER_MIN)
+            if window_start <= now <= window_end:
+                active.add(number)
+                break
+
+    return tuple(sorted(active))
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -219,6 +364,9 @@ def _cal_request(flight_number: str, dept_date: str) -> list[dict]:
     return [leg for group in result for leg in group]
 
 
+STALE_LEG_CUTOFF_HOURS = 6  # don't surface a leg further than this from "now" as if it were current
+
+
 def _pick_current_leg(legs: list[dict], now: datetime) -> dict | None:
     if not legs:
         return None
@@ -238,15 +386,21 @@ def _pick_current_leg(legs: list[dict], now: datetime) -> dict | None:
     if in_window:
         return in_window[0]
 
+    cutoff = timedelta(hours=STALE_LEG_CUTOFF_HOURS)
+
     past = [leg for leg in legs if dep_time(leg) and dep_time(leg) <= now]
     if past:
-        return max(past, key=dep_time)
+        best_past = max(past, key=dep_time)
+        if now - dep_time(best_past) <= cutoff:
+            return best_past
 
     future = [leg for leg in legs if dep_time(leg) and dep_time(leg) > now]
     if future:
-        return min(future, key=dep_time)
+        soonest_future = min(future, key=dep_time)
+        if dep_time(soonest_future) - now <= cutoff:
+            return soonest_future
 
-    return legs[0]
+    return None
 
 
 @st.cache_data(ttl=CAL_CACHE_TTL_SECONDS, show_spinner=False)
@@ -290,20 +444,32 @@ def fetch_caribbean_status(flight_numbers: tuple) -> tuple:
     now_epoch = time.time()
     fetch_times = _cal_fetch_timestamps()
 
+    def is_cached(fn):
+        last_fetch = fetch_times.get(fn)
+        return last_fetch is not None and (now_epoch - last_fetch) < CAL_CACHE_TTL_SECONDS
+
+    # Cached lookups are free (no network call), so process those first in
+    # any order. New lookups are the ones that pace/risk rate-limiting, so
+    # shuffle their order each cycle -- otherwise a rate-limit cutoff would
+    # deterministically always hit the same (sort-order-last) flights.
+    already_cached = [fn for fn in flight_numbers if is_cached(fn)]
+    needs_fetch = [fn for fn in flight_numbers if fn not in already_cached]
+    random.shuffle(needs_fetch)
+    ordered_flight_numbers = already_cached + needs_fetch
+
     rows = []
     rate_limited = False
     network_fetching_disabled = False
     made_first_real_call = False
 
-    for flight_number in flight_numbers:
-        last_fetch = fetch_times.get(flight_number)
-        is_cached = last_fetch is not None and (now_epoch - last_fetch) < CAL_CACHE_TTL_SECONDS
+    for flight_number in ordered_flight_numbers:
+        cached = is_cached(flight_number)
 
-        if not is_cached and network_fetching_disabled:
+        if not cached and network_fetching_disabled:
             continue
 
         try:
-            if not is_cached:
+            if not cached:
                 if made_first_real_call:
                     time.sleep(CAL_REQUEST_DELAY_SECONDS)
                 legs = _fetch_single_flight_legs(flight_number)
@@ -374,6 +540,8 @@ def _classify_status(row) -> str:
 
 
 def _minutes_since_due_departure(row) -> float | None:
+    if row.get("status") == "Cancelled":
+        return None  # "still waiting to depart" is meaningless for a cancelled flight
     if _present(row.get("dep_actual")):
         return None
     scheduled = row.get("dep_scheduled")
