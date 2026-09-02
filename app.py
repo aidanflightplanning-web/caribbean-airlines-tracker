@@ -174,19 +174,12 @@ def main():
         )
         return
 
-    overdue = table[table["is_overdue"]]
     diverting = table[table["is_diverting"]]
 
     for _, row in diverting.iterrows():
         st.error(
             f"⚠️ **DIVERTING** — {row.get('flight_iata') or row.get('callsign')} "
             f"({row.get('dep_iata') or '?'} → {row.get('arr_iata') or '?'})"
-        )
-    for _, row in overdue.iterrows():
-        st.warning(
-            f"⏰ **OVERDUE** — {row.get('flight_iata') or row.get('callsign')} "
-            f"has not landed more than 30 min after its scheduled arrival "
-            f"({fmt_time(row.get('arr_scheduled'))})"
         )
 
     display = pd.DataFrame({

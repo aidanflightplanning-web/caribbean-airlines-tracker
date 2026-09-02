@@ -87,7 +87,6 @@ ADSB_QUERY_LON = -61.3372
 ADSB_QUERY_RADIUS_NM = 4000
 
 CALLSIGN_PREFIX = "BWA"  # Caribbean Airlines ICAO code
-OVERDUE_THRESHOLD_MINUTES = 30
 CAL_REQUEST_DELAY_SECONDS = 1.5  # pacing between new (non-cached) per-flight lookups
 # Deliberately longer than the 10-min refresh cadence: with the schedule
 # roster now feeding in ~15-20 candidates at once, a TTL equal to the
@@ -613,19 +612,6 @@ def _eta(row):
     return estimated if _present(estimated) else row.get("arr_scheduled")
 
 
-def _is_overdue(row) -> bool:
-    if _present(row.get("arr_actual")):
-        return False
-    raw = row.get("flight_status")
-    raw_status = raw.lower() if _present(raw) and isinstance(raw, str) else ""
-    if raw_status in {"cancelled", "landed"}:
-        return False
-    eta = row.get("arr_scheduled")
-    if not _present(eta):
-        return False
-    return (_now_utc() - eta).total_seconds() / 60 > OVERDUE_THRESHOLD_MINUTES
-
-
 def build_flight_table(positions_df: pd.DataFrame, cal_df: pd.DataFrame) -> pd.DataFrame:
     """Merge live position data with CAL schedule/status data by callsign."""
     if cal_df.empty:
@@ -645,7 +631,6 @@ def build_flight_table(positions_df: pd.DataFrame, cal_df: pd.DataFrame) -> pd.D
     merged["minutes_since_due_departure"] = merged.apply(_minutes_since_due_departure, axis=1)
     merged["departure_delay_minutes"] = merged.apply(_departure_delay_minutes, axis=1)
     merged["eta"] = merged.apply(_eta, axis=1)
-    merged["is_overdue"] = merged.apply(_is_overdue, axis=1)
     merged["is_diverting"] = merged["status"] == "Diverted"
 
     merged = merged.sort_values(
