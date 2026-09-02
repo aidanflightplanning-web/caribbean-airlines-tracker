@@ -1,7 +1,10 @@
 """Caribbean Airlines (BWA) flight tracker for dispatchers.
 
-Combines live ADS-B data (OpenSky Network) with scheduled times and flight
-status (AviationStack) into a single dispatch-facing table.
+Combines live ADS-B data (OpenSky Network) with Caribbean Airlines' own
+flight-status data (looked up per airborne flight number) into a single
+dispatch-facing table. See flights.py for why this only covers flights
+that have already departed (OpenSky-discoverable), not the full day's
+schedule.
 """
 
 import time
@@ -9,7 +12,12 @@ import time
 import pandas as pd
 import streamlit as st
 
-from flights import build_flight_table, fetch_aviationstack_flights, fetch_opensky_states, get_secret
+from flights import (
+    airborne_flight_numbers,
+    build_flight_table,
+    fetch_caribbean_status,
+    fetch_opensky_states,
+)
 
 st.set_page_config(page_title="Caribbean Airlines Flight Tracker", page_icon="✈️", layout="wide")
 
@@ -45,28 +53,22 @@ def fmt_minutes(value) -> str:
 
 def main():
     st.title("✈️ Caribbean Airlines Flight Tracker")
-    st.caption("Callsign BWA · Live position via OpenSky Network · Schedule/status via AviationStack")
+    st.caption("Callsign BWA · Live position via OpenSky Network · Schedule/status via Caribbean Airlines")
 
     with st.sidebar:
         st.header("Controls")
         if st.button("🔄 Refresh now", use_container_width=True):
             fetch_opensky_states.clear()
-            fetch_aviationstack_flights.clear()
+            fetch_caribbean_status.clear()
             st.rerun()
 
         st.caption(
-            "Live position refreshes automatically about every 60s. "
-            "Schedule/status data is cached for 30 minutes to conserve "
-            "AviationStack's free-tier quota (100 requests/month) — use "
+            "Shows flights OpenSky has already spotted airborne — a flight "
+            "still on the ground pre-departure won't appear until wheels-up. "
+            "Schedule/status lookups are paced and cached for 5 minutes to "
+            "avoid tripping Caribbean Airlines' own rate limiting; use "
             "Refresh now sparingly."
         )
-
-        if not get_secret("AVIATIONSTACK_API_KEY"):
-            st.warning(
-                "No AVIATIONSTACK_API_KEY set. The table will show live "
-                "position only, with no schedule, status, or ETA data. "
-                "Add a key in .streamlit/secrets.toml (see README)."
-            )
 
     try:
         opensky_df = fetch_opensky_states()
@@ -74,16 +76,26 @@ def main():
         st.error(f"Failed to fetch OpenSky data: {exc}")
         opensky_df = pd.DataFrame()
 
-    try:
-        aviationstack_df = fetch_aviationstack_flights()
-    except Exception as exc:
-        st.error(f"Failed to fetch AviationStack data: {exc}")
-        aviationstack_df = pd.DataFrame()
+    flight_numbers = airborne_flight_numbers(opensky_df)
 
-    table = build_flight_table(opensky_df, aviationstack_df)
+    cal_df = pd.DataFrame()
+    rate_limited = False
+    try:
+        cal_df, rate_limited = fetch_caribbean_status(flight_numbers)
+    except Exception as exc:
+        st.error(f"Failed to fetch Caribbean Airlines status data: {exc}")
+
+    if rate_limited:
+        st.warning(
+            "Caribbean Airlines' status endpoint rate-limited this request "
+            "partway through — showing partial results. It will retry on "
+            "the next refresh."
+        )
+
+    table = build_flight_table(opensky_df, cal_df)
 
     if table.empty:
-        st.info("No BWA flights currently found in either data source.")
+        st.info("No BWA flights currently airborne.")
         return
 
     overdue = table[table["is_overdue"]]
@@ -97,7 +109,7 @@ def main():
     for _, row in overdue.iterrows():
         st.warning(
             f"⏰ **OVERDUE** — {row.get('flight_iata') or row.get('callsign')} "
-            f"has not landed more than {int(30)} min after its scheduled arrival "
+            f"has not landed more than 30 min after its scheduled arrival "
             f"({fmt_time(row.get('arr_scheduled'))})"
         )
 
@@ -108,6 +120,7 @@ def main():
         "Scheduled Dep.": table["dep_scheduled"].apply(fmt_time),
         "Min. Since Due": table["minutes_since_due_departure"].apply(fmt_minutes),
         "ETA": table["eta"].apply(fmt_time),
+        "Tail #": table["tailnumber"].fillna("—"),
         "On Ground": table["on_ground"].map({True: "Yes", False: "No"}).fillna("—"),
     })
 

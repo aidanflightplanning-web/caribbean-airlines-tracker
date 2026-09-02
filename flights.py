@@ -1,22 +1,41 @@
 """Data fetching and merge logic for tracking Caribbean Airlines (BWA) flights.
 
 Two data sources are combined, matched by ICAO callsign:
-  - OpenSky Network: live position / on-ground status (no schedule data)
-  - AviationStack:   scheduled/estimated times and flight status (no reliable live position on the free tier)
+  - OpenSky Network: live position, on-ground status, and which BWA flight
+    numbers are currently airborne (no schedule data).
+  - Caribbean Airlines' own internal flight-status endpoint (undocumented,
+    used by caribbean-airlines.com's own "Flight Status" page): scheduled
+    times, actual/estimated departure & arrival, and flight status, looked
+    up per flight number.
+
+This app only queries CAL's endpoint for flight numbers OpenSky has already
+confirmed are airborne. That endpoint is rate-limited/WAF-protected (found
+by testing: bulk/rapid querying returns HTTP 429), so it is NOT safe to
+scan the full route network to build a complete schedule — only a small,
+paced, per-flight lookup is used. Consequence: a flight that hasn't
+departed yet (not visible on ADS-B) won't appear here until wheels-up.
 """
 
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import requests
 import streamlit as st
 
 OPENSKY_STATES_URL = "https://opensky-network.org/api/states/all"
-AVIATIONSTACK_URL = "http://api.aviationstack.com/v1/flights"
+CAL_STATUS_URL = "https://www.caribbean-airlines.com/get/Flight/Status"
 
 CALLSIGN_PREFIX = "BWA"  # Caribbean Airlines ICAO code
-AIRLINE_IATA = "BW"
 OVERDUE_THRESHOLD_MINUTES = 30
+CAL_REQUEST_DELAY_SECONDS = 1.5  # pacing between per-flight lookups, to stay well under CAL's rate limit
+
+CAL_HEADERS = {
+    "Content-Type": "application/json",
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+    "Referer": "https://www.caribbean-airlines.com/",
+}
 
 OPENSKY_STATE_COLUMNS = [
     "icao24", "callsign", "origin_country", "time_position", "last_contact",
@@ -24,6 +43,16 @@ OPENSKY_STATE_COLUMNS = [
     "true_track", "vertical_rate", "sensors", "geo_altitude", "squawk",
     "spi", "position_source",
 ]
+
+CAL_STATUS_MAP = {
+    "airborne": "active",
+    "completed": "landed",
+    "landed": "landed",
+    "cancelled": "cancelled",
+    "diverted": "diverted",
+    "delayed": "delayed",
+    "scheduled": "scheduled",
+}
 
 
 def _present(value) -> bool:
@@ -75,76 +104,140 @@ def fetch_opensky_states() -> pd.DataFrame:
     return df[df["callsign"].str.startswith(CALLSIGN_PREFIX)].reset_index(drop=True)
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def fetch_aviationstack_flights(_cache_bust: int = 0) -> pd.DataFrame:
-    """Scheduled/estimated times and flight status for Caribbean Airlines flights.
+def airborne_flight_numbers(opensky_df: pd.DataFrame) -> tuple:
+    if opensky_df.empty:
+        return tuple()
+    numbers = opensky_df["callsign"].str[len(CALLSIGN_PREFIX):].str.strip()
+    numbers = numbers[numbers.str.len() > 0]
+    return tuple(sorted(numbers.unique()))
 
-    Cached for 30 minutes by default to conserve AviationStack's free-tier
-    quota (100 requests/month). `_cache_bust` lets the sidebar "Refresh now"
-    button force a real fetch without changing the normal TTL behavior.
-    """
-    api_key = get_secret("AVIATIONSTACK_API_KEY")
-    if not api_key:
-        return pd.DataFrame()
 
-    resp = requests.get(
-        AVIATIONSTACK_URL,
-        params={"access_key": api_key, "airline_iata": AIRLINE_IATA, "limit": 100},
-        timeout=20,
+def _cal_request(flight_number: str, dept_date: str) -> list[dict]:
+    resp = requests.post(
+        CAL_STATUS_URL,
+        headers=CAL_HEADERS,
+        json={"to": "", "from": "", "dept_date": dept_date, "flight_number": flight_number},
+        timeout=15,
     )
-    resp.raise_for_status()
-    payload = resp.json()
+    if resp.status_code != 200:
+        raise RuntimeError(f"HTTP {resp.status_code}")
+    body = resp.json()
+    data = body.get("data") or {}
+    if data.get("status") != "Success":
+        return []
+    result = data.get("result") or []
+    return [leg for group in result for leg in group]
 
-    if "error" in payload:
-        raise RuntimeError(payload["error"].get("message", "AviationStack API error"))
+
+def _pick_current_leg(legs: list[dict], now: datetime) -> dict | None:
+    if not legs:
+        return None
+
+    def dep_time(leg):
+        return _parse_iso(leg.get("std_utc"))
+
+    airborne = [leg for leg in legs if (leg.get("flight_status") or "").lower() == "airborne"]
+    if airborne:
+        return airborne[0]
+
+    in_window = []
+    for leg in legs:
+        dep, arr = dep_time(leg), _parse_iso(leg.get("sta_utc"))
+        if dep and arr and dep <= now <= arr + timedelta(hours=2):
+            in_window.append(leg)
+    if in_window:
+        return in_window[0]
+
+    past = [leg for leg in legs if dep_time(leg) and dep_time(leg) <= now]
+    if past:
+        return max(past, key=dep_time)
+
+    future = [leg for leg in legs if dep_time(leg) and dep_time(leg) > now]
+    if future:
+        return min(future, key=dep_time)
+
+    return legs[0]
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_caribbean_status(flight_numbers: tuple) -> tuple:
+    """Look up schedule/status for each given flight number via CAL's own
+    flight-status endpoint. Returns (DataFrame, rate_limited: bool).
+
+    Paced with a delay between requests; stops early (rate_limited=True)
+    the moment a request fails, rather than retrying into a block.
+    """
+    if not flight_numbers:
+        return pd.DataFrame(), False
+
+    now = _now_utc()
+    dates_to_try = [now.strftime("%Y%m%d"), (now - timedelta(days=1)).strftime("%Y%m%d")]
 
     rows = []
-    for entry in payload.get("data", []):
-        flight = entry.get("flight") or {}
-        departure = entry.get("departure") or {}
-        arrival = entry.get("arrival") or {}
+    rate_limited = False
+    for i, flight_number in enumerate(flight_numbers):
+        if i > 0:
+            time.sleep(CAL_REQUEST_DELAY_SECONDS)
+        try:
+            legs = []
+            for dept_date in dates_to_try:
+                legs = _cal_request(flight_number, dept_date)
+                if legs:
+                    break
+        except Exception:
+            rate_limited = True
+            break
+
+        leg = _pick_current_leg(legs, now)
+        if leg is None:
+            continue
+
+        dep_actual = _parse_iso((leg.get("mvt_times") or {}).get("actual_block_off"))
+        arr_actual = _parse_iso((leg.get("mvt_times") or {}).get("actual_block_on")) \
+            or _parse_iso((leg.get("mvt_times") or {}).get("actual_touch_down"))
+        arr_estimated = _parse_iso((leg.get("mvt_times") or {}).get("estimated_touch_down")) \
+            or _parse_iso((leg.get("mvt_times") or {}).get("estimated_block_on"))
+
         rows.append({
-            "callsign": (flight.get("icao") or "").strip(),
-            "flight_iata": flight.get("iata"),
-            "flight_status": entry.get("flight_status"),
-            "dep_airport": departure.get("airport"),
-            "dep_iata": departure.get("iata"),
-            "dep_scheduled": _parse_iso(departure.get("scheduled")),
-            "dep_estimated": _parse_iso(departure.get("estimated")),
-            "dep_actual": _parse_iso(departure.get("actual")),
-            "dep_delay_min": departure.get("delay"),
-            "arr_airport": arrival.get("airport"),
-            "arr_iata": arrival.get("iata"),
-            "arr_scheduled": _parse_iso(arrival.get("scheduled")),
-            "arr_estimated": _parse_iso(arrival.get("estimated")),
-            "arr_actual": _parse_iso(arrival.get("actual")),
-            "arr_delay_min": arrival.get("delay"),
+            "callsign": f"{CALLSIGN_PREFIX}{flight_number}",
+            "flight_iata": f"BW{flight_number}",
+            "flight_status": CAL_STATUS_MAP.get((leg.get("flight_status") or "").lower(), leg.get("flight_status")),
+            "dep_airport": leg.get("dept_city"),
+            "dep_iata": leg.get("dept_code"),
+            "dep_scheduled": _parse_iso(leg.get("std_utc")),
+            "dep_estimated": None,
+            "dep_actual": dep_actual,
+            "arr_airport": leg.get("arr_city"),
+            "arr_iata": leg.get("arr_code"),
+            "arr_scheduled": _parse_iso(leg.get("sta_utc")),
+            "arr_estimated": arr_estimated,
+            "arr_actual": arr_actual,
+            "aircraft_type": leg.get("aircraft_type"),
+            "tailnumber": leg.get("tailnumber"),
         })
 
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows), rate_limited
 
 
 def _classify_status(row) -> str:
-    raw_status = (row.get("flight_status") or "").lower()
+    raw = row.get("flight_status")
+    raw_status = raw.lower() if _present(raw) and isinstance(raw, str) else ""
     if raw_status == "cancelled":
         return "Cancelled"
     if raw_status == "diverted":
         return "Diverted"
-    if raw_status == "incident":
-        return "Incident"
+    if raw_status == "delayed":
+        return "Delayed"
     if raw_status == "landed":
         return "Landed"
 
-    dep_delay = row.get("dep_delay_min")
-    arr_delay = row.get("arr_delay_min")
-    delay = dep_delay if _present(dep_delay) else (arr_delay if _present(arr_delay) else 0)
-    try:
-        delay = float(delay)
-    except (TypeError, ValueError):
-        delay = 0
+    dep_scheduled = row.get("dep_scheduled")
+    dep_actual = row.get("dep_actual")
+    if _present(dep_scheduled) and _present(dep_actual):
+        delay = (dep_actual - dep_scheduled).total_seconds() / 60
+        if delay >= 15:
+            return "Delayed"
 
-    if delay >= 15:
-        return "Delayed"
     if raw_status == "active":
         return "En Route"
     if raw_status == "scheduled":
@@ -170,7 +263,9 @@ def _eta(row):
 def _is_overdue(row) -> bool:
     if _present(row.get("arr_actual")):
         return False
-    if (row.get("flight_status") or "").lower() in {"cancelled", "landed"}:
+    raw = row.get("flight_status")
+    raw_status = raw.lower() if _present(raw) and isinstance(raw, str) else ""
+    if raw_status in {"cancelled", "landed"}:
         return False
     eta = row.get("arr_scheduled")
     if not _present(eta):
@@ -178,17 +273,17 @@ def _is_overdue(row) -> bool:
     return (_now_utc() - eta).total_seconds() / 60 > OVERDUE_THRESHOLD_MINUTES
 
 
-def build_flight_table(opensky_df: pd.DataFrame, aviationstack_df: pd.DataFrame) -> pd.DataFrame:
-    """Merge live position data with schedule/status data by callsign."""
-    if aviationstack_df.empty:
+def build_flight_table(opensky_df: pd.DataFrame, cal_df: pd.DataFrame) -> pd.DataFrame:
+    """Merge live position data with CAL schedule/status data by callsign."""
+    if cal_df.empty:
         merged = opensky_df.copy()
         for col in ["flight_iata", "flight_status", "dep_airport", "dep_iata",
-                     "dep_scheduled", "dep_estimated", "dep_actual", "dep_delay_min",
+                     "dep_scheduled", "dep_estimated", "dep_actual",
                      "arr_airport", "arr_iata", "arr_scheduled", "arr_estimated",
-                     "arr_actual", "arr_delay_min"]:
+                     "arr_actual", "aircraft_type", "tailnumber"]:
             merged[col] = None
     else:
-        merged = pd.merge(aviationstack_df, opensky_df, on="callsign", how="outer")
+        merged = pd.merge(cal_df, opensky_df, on="callsign", how="outer")
 
     if merged.empty:
         return merged
