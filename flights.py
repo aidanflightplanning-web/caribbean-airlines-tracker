@@ -70,7 +70,7 @@ AIRPORT_UTC_OFFSET_HOURS = {
     "PBM": -3, "KIN": -5, "ORY": 2,
 }
 SCHEDULE_PRE_DEPARTURE_BUFFER_MIN = 45
-SCHEDULE_POST_ARRIVAL_BUFFER_MIN = 180
+SCHEDULE_POST_ARRIVAL_BUFFER_MIN = 30
 _WEEKDAY_KEYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 # Point+radius queries against community ADS-B aggregators (readsb/tar1090
