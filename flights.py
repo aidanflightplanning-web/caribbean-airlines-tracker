@@ -88,7 +88,17 @@ def _parse_iso(value):
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_live_positions() -> pd.DataFrame:
     """Live position/on-ground status for aircraft currently squawking a BWA
-    callsign, via a community ADS-B aggregator (adsb.lol, then adsb.fi)."""
+    callsign, via community ADS-B aggregators (adsb.lol and adsb.fi).
+
+    Queries every source and takes the union of what each finds, rather
+    than stopping at the first success — these are independent volunteer
+    feeder networks with real, non-identical coverage gaps (confirmed by
+    testing: adsb.lol alone missed real live BWA flights that adsb.fi or
+    OpenSky picked up), so combining them catches more real aircraft than
+    either alone. Only raises if every source fails.
+    """
+    seen = {}
+    any_success = False
     last_exc = None
     for template in ADSB_SOURCES:
         url = template.format(lat=ADSB_QUERY_LAT, lon=ADSB_QUERY_LON, radius=ADSB_QUERY_RADIUS_NM)
@@ -100,19 +110,20 @@ def fetch_live_positions() -> pd.DataFrame:
             last_exc = exc
             continue
 
-        rows = []
+        any_success = True
         for ac in payload.get("ac") or []:
             callsign = (ac.get("flight") or "").strip()
-            if not callsign.startswith(CALLSIGN_PREFIX):
+            if not callsign.startswith(CALLSIGN_PREFIX) or callsign in seen:
                 continue
-            rows.append({
+            seen[callsign] = {
                 "icao24": ac.get("hex"),
                 "callsign": callsign,
                 "on_ground": ac.get("alt_baro") == "ground",
-            })
-        return pd.DataFrame(rows, columns=["icao24", "callsign", "on_ground"])
+            }
 
-    raise last_exc
+    if not any_success:
+        raise last_exc
+    return pd.DataFrame(list(seen.values()), columns=["icao24", "callsign", "on_ground"])
 
 
 def airborne_flight_numbers(positions_df: pd.DataFrame) -> tuple:
