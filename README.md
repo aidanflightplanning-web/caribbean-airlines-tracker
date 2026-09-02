@@ -1,6 +1,6 @@
 # Caribbean Airlines Flight Tracker
 
-A large-format Streamlit dashboard for a dispatch office monitor, tracking Caribbean Airlines flights (ICAO callsign `BWA`). Shows flight status, scheduled departure time, minutes elapsed since a delayed flight was due to depart, and ETA — with warning banners for diverting or overdue aircraft (not landed 30+ minutes after scheduled arrival). Auto-refreshes every 10 minutes; no interaction needed once it's up on the monitor.
+A Streamlit dashboard for a dispatch office monitor, tracking Caribbean Airlines flights (ICAO callsign `BWA`). Shows flight status, scheduled departure time, minutes elapsed since a delayed flight was due to depart, how many minutes late a flight actually pushed back, and ETA — with warning banners for diverting or overdue aircraft (not landed 30+ minutes after scheduled arrival). Auto-refreshes every 10 minutes; no interaction needed once it's up on the monitor. Sized in viewport-relative units so the whole board fits on one screen without scrolling, regardless of the monitor's actual resolution.
 
 **No API key or account required.**
 
@@ -81,6 +81,7 @@ No secrets needed. (`.streamlit/secrets.toml.example` is kept as a placeholder i
 
 - Times are shown in UTC ("Z"), the standard aviation/dispatch convention.
 - "Overdue" triggers 30 minutes past scheduled arrival if the flight hasn't landed; "Diverting" triggers on Caribbean Airlines' own "Diverted" status if/when it appears in their feed.
+- Status is "En Route" for any airborne flight regardless of how late it departed — a delayed departure doesn't keep showing "Delayed" once wheels-up. "Min. Since Due" (a live-updating countdown) only applies before departure; "Dep. Delay" (a fixed figure — how many minutes late it actually pushed back) only applies after.
 - The schedule timetable is fetched once per origin airport (25 requests, ~1s apart) and cached for 6 hours.
 - The ADS-B query is a single point+radius search (4,000 nm from Piarco/POS) covering CAL's entire route network in one request, cached for 60s.
 - The CAL live-status lookup is cached per flight number for 20 minutes and paced at ~1.5s/request (only for numbers not already cached, in shuffled order); if it still gets rate-limited mid-refresh, the app shows a warning and whatever results it already has, and retries the missing ones on the next cycle.

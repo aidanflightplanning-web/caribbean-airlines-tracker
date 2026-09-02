@@ -44,29 +44,36 @@ STATUS_COLORS = {
 KIOSK_CSS = """
 <meta http-equiv="refresh" content="%d">
 <style>
+    /* Sized in vh (viewport height) throughout, not rem/px, so the whole
+       board scales to fill whatever the actual overhead monitor's
+       resolution is and stays a single no-scroll screen rather than being
+       tuned to one specific display. */
     #MainMenu, header, footer { visibility: hidden; }
-    .block-container { padding-top: 2rem; max-width: 100%%; }
+    .block-container { padding-top: 1vh; padding-bottom: 1vh; max-width: 100%%; }
+    div[data-testid="stVerticalBlock"] { gap: 0.4vh; }
+    .element-container { margin-bottom: 0 !important; }
 
-    h1 { font-size: 3.2rem !important; }
-    .subtitle { font-size: 1.3rem; color: #888; margin-top: -0.8rem; margin-bottom: 1.5rem; }
-    .footer-note { font-size: 1.05rem; color: #888; margin-top: 1.2rem; }
+    h1 { font-size: 2.6vh !important; margin: 0 !important; line-height: 1.2 !important; }
+    .subtitle { font-size: 1.3vh; color: #888; margin: 0 0 0.6vh 0; }
+    .footer-note { font-size: 1.1vh; color: #888; margin-top: 0.6vh; }
 
-    div[data-testid="stAlert"] { font-size: 1.4rem; padding: 1rem 1.2rem; }
+    div[data-testid="stAlert"] { font-size: 1.5vh; padding: 0.5vh 0.8vh; }
+    div[data-testid="stAlert"] p { font-size: 1.5vh; margin: 0; }
 
-    table.flight-board { width: 100%%; border-collapse: collapse; font-size: 1.5rem; }
+    table.flight-board { width: 100%%; border-collapse: collapse; font-size: 1.9vh; }
     table.flight-board th {
-        text-align: left; padding: 16px 20px; border-bottom: 3px solid #ccc;
-        font-size: 1.05rem; text-transform: uppercase; letter-spacing: 0.04em;
-        color: #888; font-weight: 600;
+        text-align: left; padding: 0.5vh 0.8vh; border-bottom: 0.25vh solid #ccc;
+        font-size: 1.2vh; text-transform: uppercase; letter-spacing: 0.04em;
+        color: #888; font-weight: 600; white-space: nowrap;
     }
     table.flight-board td {
-        padding: 18px 20px; border-bottom: 1px solid #eee; white-space: nowrap;
+        padding: 0.5vh 0.8vh; border-bottom: 0.1vh solid #eee; white-space: nowrap;
     }
     table.flight-board tr:nth-child(even) { background: rgba(127, 127, 127, 0.06); }
 
     .status-badge {
-        display: inline-block; padding: 8px 20px; border-radius: 8px;
-        color: white; font-weight: 700; font-size: 1.3rem;
+        display: inline-block; padding: 0.3vh 1vh; border-radius: 0.6vh;
+        color: white; font-weight: 700; font-size: 1.6vh;
     }
 </style>
 """ % REFRESH_SECONDS
@@ -85,9 +92,12 @@ def fmt_refresh_interval(seconds: int) -> str:
 
 
 def fmt_time(value) -> str:
+    """Time-of-day only (no date) to keep rows compact — this board only
+    ever shows flights within roughly a day of "now" anyway (see flights.py's
+    staleness cutoff), so the date rarely adds information worth the width."""
     if value is None or pd.isna(value):
         return "—"
-    return value.strftime("%Y-%m-%d %H:%M") + "Z"
+    return value.strftime("%H:%M") + "Z"
 
 
 def fmt_minutes(value) -> str:
@@ -183,8 +193,9 @@ def main():
         "Flight": table["flight_iata"].fillna(table["callsign"]),
         "Route": table["dep_iata"].fillna("?") + " → " + table["arr_iata"].fillna("?"),
         "Status": table["status"],
-        "Scheduled Dep.": table["dep_scheduled"].apply(fmt_time),
+        "Sched. Dep.": table["dep_scheduled"].apply(fmt_time),
         "Min. Since Due": table["minutes_since_due_departure"].apply(fmt_minutes),
+        "Dep. Delay": table["departure_delay_minutes"].apply(fmt_minutes),
         "ETA": table["eta"].apply(fmt_time),
         "Tail #": table["tailnumber"].fillna("—"),
         "On Ground": table["on_ground"].map({True: "Yes", False: "No"}).fillna("—"),

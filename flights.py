@@ -516,24 +516,27 @@ def fetch_caribbean_status(flight_numbers: tuple) -> tuple:
 def _classify_status(row) -> str:
     raw = row.get("flight_status")
     raw_status = raw.lower() if _present(raw) and isinstance(raw, str) else ""
+
     if raw_status == "cancelled":
         return "Cancelled"
     if raw_status == "diverted":
         return "Diverted"
-    if raw_status == "delayed":
-        return "Delayed"
     if raw_status == "landed":
         return "Landed"
+    if raw_status == "active":
+        return "En Route"  # once airborne, always En Route -- a late departure doesn't change that
 
+    # Not airborne (or CAL's status is unclear) -- check whether it's overdue
+    # departing, using "now" rather than an actual departure time it doesn't
+    # have yet.
     dep_scheduled = row.get("dep_scheduled")
-    dep_actual = row.get("dep_actual")
-    if _present(dep_scheduled) and _present(dep_actual):
-        delay = (dep_actual - dep_scheduled).total_seconds() / 60
-        if delay >= 15:
+    if _present(dep_scheduled) and not _present(row.get("dep_actual")):
+        overdue_departure = (_now_utc() - dep_scheduled).total_seconds() / 60
+        if overdue_departure >= 15:
             return "Delayed"
 
-    if raw_status == "active":
-        return "En Route"
+    if raw_status == "delayed":
+        return "Delayed"
     if raw_status == "scheduled":
         return "Scheduled"
     return raw_status.title() if raw_status else "Unknown"
@@ -549,6 +552,17 @@ def _minutes_since_due_departure(row) -> float | None:
         return None
     delta = (_now_utc() - scheduled).total_seconds() / 60
     return round(delta, 1) if delta > 0 else None
+
+
+def _departure_delay_minutes(row) -> float | None:
+    """How late a flight actually pushed back, once it's departed -- distinct
+    from minutes_since_due_departure, which only applies pre-departure."""
+    dep_scheduled = row.get("dep_scheduled")
+    dep_actual = row.get("dep_actual")
+    if not _present(dep_scheduled) or not _present(dep_actual):
+        return None
+    delta = (dep_actual - dep_scheduled).total_seconds() / 60
+    return round(delta, 1) if delta > 0 else 0.0
 
 
 def _eta(row):
@@ -586,6 +600,7 @@ def build_flight_table(positions_df: pd.DataFrame, cal_df: pd.DataFrame) -> pd.D
 
     merged["status"] = merged.apply(_classify_status, axis=1)
     merged["minutes_since_due_departure"] = merged.apply(_minutes_since_due_departure, axis=1)
+    merged["departure_delay_minutes"] = merged.apply(_departure_delay_minutes, axis=1)
     merged["eta"] = merged.apply(_eta, axis=1)
     merged["is_overdue"] = merged.apply(_is_overdue, axis=1)
     merged["is_diverting"] = merged["status"] == "Diverted"
