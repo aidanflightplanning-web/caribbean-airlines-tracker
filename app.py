@@ -1,12 +1,14 @@
-"""Caribbean Airlines (BWA) flight tracker for dispatchers.
+"""Caribbean Airlines (BWA) flight tracker — dedicated dispatch-office display.
 
 Combines live ADS-B data (OpenSky Network) with Caribbean Airlines' own
 flight-status data (looked up per airborne flight number) into a single
-dispatch-facing table. See flights.py for why this only covers flights
-that have already departed (OpenSky-discoverable), not the full day's
-schedule.
+large-format table meant for an unattended wall/office monitor. Auto-
+refreshes the page every 60 seconds. See flights.py for why this only
+covers flights that have already departed (OpenSky-discoverable), not
+the full day's schedule.
 """
 
+import html
 import time
 
 import pandas as pd
@@ -18,6 +20,8 @@ from flights import (
     fetch_caribbean_status,
     fetch_opensky_states,
 )
+
+REFRESH_SECONDS = 60
 
 st.set_page_config(page_title="Caribbean Airlines Flight Tracker", page_icon="✈️", layout="wide")
 
@@ -33,10 +37,40 @@ STATUS_COLORS = {
     "Unknown": "#7a7a7a",
 }
 
+KIOSK_CSS = """
+<meta http-equiv="refresh" content="%d">
+<style>
+    #MainMenu, header, footer { visibility: hidden; }
+    .block-container { padding-top: 2rem; max-width: 100%%; }
 
-def style_status(value: str) -> str:
+    h1 { font-size: 3.2rem !important; }
+    .subtitle { font-size: 1.3rem; color: #888; margin-top: -0.8rem; margin-bottom: 1.5rem; }
+    .footer-note { font-size: 1.05rem; color: #888; margin-top: 1.2rem; }
+
+    div[data-testid="stAlert"] { font-size: 1.4rem; padding: 1rem 1.2rem; }
+
+    table.flight-board { width: 100%%; border-collapse: collapse; font-size: 1.5rem; }
+    table.flight-board th {
+        text-align: left; padding: 16px 20px; border-bottom: 3px solid #ccc;
+        font-size: 1.05rem; text-transform: uppercase; letter-spacing: 0.04em;
+        color: #888; font-weight: 600;
+    }
+    table.flight-board td {
+        padding: 18px 20px; border-bottom: 1px solid #eee; white-space: nowrap;
+    }
+    table.flight-board tr:nth-child(even) { background: rgba(127, 127, 127, 0.06); }
+
+    .status-badge {
+        display: inline-block; padding: 8px 20px; border-radius: 8px;
+        color: white; font-weight: 700; font-size: 1.3rem;
+    }
+</style>
+""" % REFRESH_SECONDS
+
+
+def status_badge(value: str) -> str:
     color = STATUS_COLORS.get(value, "#7a7a7a")
-    return f"background-color: {color}; color: white; font-weight: 600; text-align: center; border-radius: 4px;"
+    return f'<span class="status-badge" style="background-color:{color}">{html.escape(value)}</span>'
 
 
 def fmt_time(value) -> str:
@@ -51,24 +85,32 @@ def fmt_minutes(value) -> str:
     return f"{int(value)} min"
 
 
+def render_table(display: pd.DataFrame) -> str:
+    header_cells = "".join(f"<th>{html.escape(col)}</th>" for col in display.columns)
+    rows_html = []
+    for _, row in display.iterrows():
+        cells = []
+        for col, value in row.items():
+            cell = status_badge(value) if col == "Status" else html.escape(str(value))
+            cells.append(f"<td>{cell}</td>")
+        rows_html.append(f"<tr>{''.join(cells)}</tr>")
+    return (
+        '<table class="flight-board">'
+        f"<thead><tr>{header_cells}</tr></thead>"
+        f"<tbody>{''.join(rows_html)}</tbody>"
+        "</table>"
+    )
+
+
 def main():
+    st.markdown(KIOSK_CSS, unsafe_allow_html=True)
+
     st.title("✈️ Caribbean Airlines Flight Tracker")
-    st.caption("Callsign BWA · Live position via OpenSky Network · Schedule/status via Caribbean Airlines")
-
-    with st.sidebar:
-        st.header("Controls")
-        if st.button("🔄 Refresh now", use_container_width=True):
-            fetch_opensky_states.clear()
-            fetch_caribbean_status.clear()
-            st.rerun()
-
-        st.caption(
-            "Shows flights OpenSky has already spotted airborne — a flight "
-            "still on the ground pre-departure won't appear until wheels-up. "
-            "Schedule/status lookups are paced and cached for 5 minutes to "
-            "avoid tripping Caribbean Airlines' own rate limiting; use "
-            "Refresh now sparingly."
-        )
+    st.markdown(
+        '<div class="subtitle">Callsign BWA · Live position via OpenSky Network · '
+        "Schedule/status via Caribbean Airlines</div>",
+        unsafe_allow_html=True,
+    )
 
     try:
         opensky_df = fetch_opensky_states()
@@ -89,13 +131,18 @@ def main():
         st.warning(
             "Caribbean Airlines' status endpoint rate-limited this request "
             "partway through — showing partial results. It will retry on "
-            "the next refresh."
+            "the next automatic refresh."
         )
 
     table = build_flight_table(opensky_df, cal_df)
 
     if table.empty:
         st.info("No BWA flights currently airborne.")
+        st.markdown(
+            f'<div class="footer-note">Auto-refreshing every {REFRESH_SECONDS}s · '
+            f'Last checked {time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())}</div>',
+            unsafe_allow_html=True,
+        )
         return
 
     overdue = table[table["is_overdue"]]
@@ -124,11 +171,14 @@ def main():
         "On Ground": table["on_ground"].map({True: "Yes", False: "No"}).fillna("—"),
     })
 
-    styled = display.style.map(lambda v: style_status(v), subset=["Status"])
+    st.markdown(render_table(display), unsafe_allow_html=True)
 
-    st.dataframe(styled, use_container_width=True, hide_index=True, height=min(600, 60 + 35 * len(display)))
-
-    st.caption(f"Last updated {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())} · {len(display)} flight(s) shown")
+    st.markdown(
+        f'<div class="footer-note">Auto-refreshing every {REFRESH_SECONDS}s · '
+        f'Last updated {time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())} · '
+        f"{len(display)} flight(s) shown</div>",
+        unsafe_allow_html=True,
+    )
 
 
 if __name__ == "__main__":
