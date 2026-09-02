@@ -3,9 +3,9 @@
 Combines live ADS-B data (community aggregator: adsb.lol/adsb.fi) with
 Caribbean Airlines' own flight-status data (looked up per airborne flight
 number) into a single large-format table meant for an unattended wall/
-office monitor. Auto-refreshes the page every 60 seconds. See flights.py
-for why this only covers flights that have already departed (ADS-B
-discoverable), not the full day's schedule.
+office monitor. Auto-refreshes the page every REFRESH_SECONDS. See
+flights.py for why this only covers flights that have already departed
+(ADS-B discoverable) or are on the watchlist, not the full day's schedule.
 """
 
 import html
@@ -19,10 +19,12 @@ from flights import (
     build_flight_table,
     fetch_caribbean_status,
     fetch_live_positions,
+    sticky_candidates,
+    update_active_registry,
     watchlist_flight_numbers,
 )
 
-REFRESH_SECONDS = 60
+REFRESH_SECONDS = 600
 
 st.set_page_config(page_title="Caribbean Airlines Flight Tracker", page_icon="✈️", layout="wide")
 
@@ -74,6 +76,13 @@ def status_badge(value: str) -> str:
     return f'<span class="status-badge" style="background-color:{color}">{html.escape(value)}</span>'
 
 
+def fmt_refresh_interval(seconds: int) -> str:
+    if seconds % 60 == 0:
+        minutes = seconds // 60
+        return f"{minutes} min" if minutes != 1 else "1 min"
+    return f"{seconds}s"
+
+
 def fmt_time(value) -> str:
     if value is None or pd.isna(value):
         return "—"
@@ -119,9 +128,9 @@ def main():
         st.error(f"Failed to fetch live position data: {exc}")
         positions_df = pd.DataFrame()
 
-    flight_numbers = tuple(sorted(
-        set(airborne_flight_numbers(positions_df)) | set(watchlist_flight_numbers())
-    ))
+    flight_numbers = sticky_candidates(
+        airborne_flight_numbers(positions_df), watchlist_flight_numbers()
+    )
 
     cal_df = pd.DataFrame()
     rate_limited = False
@@ -138,11 +147,12 @@ def main():
         )
 
     table = build_flight_table(positions_df, cal_df)
+    update_active_registry(table)
 
     if table.empty:
         st.info("No BWA flights currently airborne.")
         st.markdown(
-            f'<div class="footer-note">Auto-refreshing every {REFRESH_SECONDS}s · '
+            f'<div class="footer-note">Auto-refreshing every {fmt_refresh_interval(REFRESH_SECONDS)} · '
             f'Last checked {time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())}</div>',
             unsafe_allow_html=True,
         )
@@ -177,7 +187,7 @@ def main():
     st.markdown(render_table(display), unsafe_allow_html=True)
 
     st.markdown(
-        f'<div class="footer-note">Auto-refreshing every {REFRESH_SECONDS}s · '
+        f'<div class="footer-note">Auto-refreshing every {fmt_refresh_interval(REFRESH_SECONDS)} · '
         f'Last updated {time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())} · '
         f"{len(display)} flight(s) shown</div>",
         unsafe_allow_html=True,

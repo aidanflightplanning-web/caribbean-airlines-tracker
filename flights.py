@@ -46,7 +46,10 @@ ADSB_QUERY_RADIUS_NM = 4000
 
 CALLSIGN_PREFIX = "BWA"  # Caribbean Airlines ICAO code
 OVERDUE_THRESHOLD_MINUTES = 30
-CAL_REQUEST_DELAY_SECONDS = 1.5  # pacing between per-flight lookups, to stay well under CAL's rate limit
+CAL_REQUEST_DELAY_SECONDS = 1.5  # pacing between new (non-cached) per-flight lookups
+CAL_CACHE_TTL_SECONDS = 600  # matches the page's 10-min auto-refresh cadence
+STICKY_GRACE_SECONDS = 20 * 60  # keep a confirmed-active flight in the candidate set this long after its last confirmation, riding out ADS-B/CAL blind spots
+TERMINAL_STATUSES = {"cancelled", "landed"}
 
 CAL_HEADERS = {
     "Content-Type": "application/json",
@@ -156,6 +159,49 @@ def airborne_flight_numbers(positions_df: pd.DataFrame) -> tuple:
     return tuple(sorted(numbers.unique()))
 
 
+@st.cache_resource
+def _active_registry() -> dict:
+    """Persists in server memory across reruns and page reloads (unlike
+    st.session_state, which resets on the meta-refresh's full page reload):
+    {flight_number: epoch of last confirmed-active sighting}."""
+    return {}
+
+
+def sticky_candidates(detected: tuple, watchlist: tuple) -> tuple:
+    """Union of this cycle's ADS-B-detected + watchlisted flight numbers
+    with recently-active ones still inside their grace period. Without
+    this, a flight flickers off the table the moment one refresh cycle's
+    ADS-B query happens to miss it, even though it's still genuinely
+    flying — confirmed by testing that no combination of ADS-B sources has
+    fully reliable per-cycle coverage.
+    """
+    registry = _active_registry()
+    now = time.time()
+    for fn in [fn for fn, ts in registry.items() if now - ts > STICKY_GRACE_SECONDS]:
+        del registry[fn]
+    combined = set(detected) | set(watchlist) | set(registry.keys())
+    return tuple(sorted(combined))
+
+
+def update_active_registry(table: pd.DataFrame) -> None:
+    """Call once per refresh with the final built table: keeps confirmed
+    non-terminal flights alive in the sticky registry, and drops ones CAL
+    confirms are Landed/Cancelled so they don't linger past that."""
+    registry = _active_registry()
+    now = time.time()
+    for _, row in table.iterrows():
+        callsign = row.get("callsign")
+        if not isinstance(callsign, str) or not callsign.startswith(CALLSIGN_PREFIX):
+            continue
+        flight_number = callsign[len(CALLSIGN_PREFIX):]
+        status = row.get("status")
+        status_lower = status.lower() if isinstance(status, str) else ""
+        if status_lower in TERMINAL_STATUSES:
+            registry.pop(flight_number, None)
+        else:
+            registry[flight_number] = now
+
+
 def _cal_request(flight_number: str, dept_date: str) -> list[dict]:
     resp = requests.post(
         CAL_STATUS_URL,
@@ -203,34 +249,72 @@ def _pick_current_leg(legs: list[dict], now: datetime) -> dict | None:
     return legs[0]
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=CAL_CACHE_TTL_SECONDS, show_spinner=False)
+def _fetch_single_flight_legs(flight_number: str) -> list[dict]:
+    now = _now_utc()
+    dates_to_try = [now.strftime("%Y%m%d"), (now - timedelta(days=1)).strftime("%Y%m%d")]
+    for dept_date in dates_to_try:
+        legs = _cal_request(flight_number, dept_date)
+        if legs:
+            return legs
+    return []
+
+
+@st.cache_resource
+def _cal_fetch_timestamps() -> dict:
+    """Tracks when each flight number was last actually fetched over the
+    network (as opposed to served from _fetch_single_flight_legs's own
+    cache), so fetch_caribbean_status knows which lookups are free
+    (cached, no pacing needed) vs. need a real, paced network call."""
+    return {}
+
+
 def fetch_caribbean_status(flight_numbers: tuple) -> tuple:
     """Look up schedule/status for each given flight number via CAL's own
     flight-status endpoint. Returns (DataFrame, rate_limited: bool).
 
-    Paced with a delay between requests; stops early (rate_limited=True)
-    the moment a request fails, rather than retrying into a block.
+    Each flight number is cached independently (ttl=CAL_CACHE_TTL_SECONDS),
+    rather than caching the whole requested batch as one unit. That matters
+    because the exact set of flight numbers asked for changes cycle to
+    cycle (as ADS-B detection shifts) — with a single whole-batch cache,
+    that alone would force a full refetch of everything, including flights
+    already known-good, and a rate-limit hit partway through would drop
+    every flight after it in that batch. Per-flight caching means only
+    genuinely new/expired lookups trigger a paced network call, and a
+    rate-limit hit only affects new lookups, not already-cached ones.
     """
     if not flight_numbers:
         return pd.DataFrame(), False
 
     now = _now_utc()
-    dates_to_try = [now.strftime("%Y%m%d"), (now - timedelta(days=1)).strftime("%Y%m%d")]
+    now_epoch = time.time()
+    fetch_times = _cal_fetch_timestamps()
 
     rows = []
     rate_limited = False
-    for i, flight_number in enumerate(flight_numbers):
-        if i > 0:
-            time.sleep(CAL_REQUEST_DELAY_SECONDS)
+    network_fetching_disabled = False
+    made_first_real_call = False
+
+    for flight_number in flight_numbers:
+        last_fetch = fetch_times.get(flight_number)
+        is_cached = last_fetch is not None and (now_epoch - last_fetch) < CAL_CACHE_TTL_SECONDS
+
+        if not is_cached and network_fetching_disabled:
+            continue
+
         try:
-            legs = []
-            for dept_date in dates_to_try:
-                legs = _cal_request(flight_number, dept_date)
-                if legs:
-                    break
+            if not is_cached:
+                if made_first_real_call:
+                    time.sleep(CAL_REQUEST_DELAY_SECONDS)
+                legs = _fetch_single_flight_legs(flight_number)
+                made_first_real_call = True
+                fetch_times[flight_number] = now_epoch
+            else:
+                legs = _fetch_single_flight_legs(flight_number)
         except Exception:
             rate_limited = True
-            break
+            network_fetching_disabled = True
+            continue
 
         leg = _pick_current_leg(legs, now)
         if leg is None:
