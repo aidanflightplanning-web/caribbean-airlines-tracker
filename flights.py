@@ -123,6 +123,18 @@ def _present(value) -> bool:
     return value is not None and pd.notna(value)
 
 
+def _normalize_flight_number(raw: str) -> str:
+    """ADS-B callsigns zero-pad flight numbers under 100 (e.g. "BWA078"),
+    but CAL's own schedule/status data and its live-status endpoint use the
+    unpadded form ("78") -- and the endpoint outright rejects the padded
+    form (confirmed by testing: querying "078" returns status "Fail" while
+    "78" succeeds). Without normalizing, the same real flight gets tracked
+    as two different candidates throughout discovery/caching/display."""
+    raw = (raw or "").strip()
+    stripped = raw.lstrip("0")
+    return stripped if stripped else raw
+
+
 def get_secret(key: str):
     """st.secrets raises if no secrets.toml exists at all, even via .get()."""
     try:
@@ -141,7 +153,7 @@ def watchlist_flight_numbers() -> tuple:
     on top of whatever's airborne.
     """
     raw = get_secret("WATCHLIST_FLIGHT_NUMBERS") or ""
-    numbers = [n.strip() for n in raw.replace("\n", ",").split(",")]
+    numbers = [_normalize_flight_number(n) for n in raw.replace("\n", ",").split(",")]
     return tuple(sorted({n for n in numbers if n}))
 
 
@@ -217,7 +229,7 @@ def active_scheduled_flight_numbers(roster: list) -> tuple:
         flight_num = (entry.get("flight_num") or "").strip().upper()
         if not flight_num.startswith("BW"):
             continue
-        number = flight_num[2:].strip()
+        number = _normalize_flight_number(flight_num[2:])
         if not number:
             continue
 
@@ -282,12 +294,20 @@ def fetch_live_positions() -> pd.DataFrame:
 
         any_success = True
         for ac in payload.get("ac") or []:
-            callsign = (ac.get("flight") or "").strip()
-            if not callsign.startswith(CALLSIGN_PREFIX) or callsign in seen:
+            raw_callsign = (ac.get("flight") or "").strip()
+            if not raw_callsign.startswith(CALLSIGN_PREFIX):
                 continue
-            seen[callsign] = {
+            # Normalize to the unpadded form (ADS-B zero-pads flight numbers
+            # under 100, e.g. "BWA078", but CAL's own data and endpoint use
+            # "78") so this lines up with cal_df's callsign for the merge,
+            # and so two sources reporting the same flight with different
+            # padding dedupe into one row instead of two.
+            flight_number = _normalize_flight_number(raw_callsign[len(CALLSIGN_PREFIX):])
+            if not flight_number or flight_number in seen:
+                continue
+            seen[flight_number] = {
                 "icao24": ac.get("hex"),
-                "callsign": callsign,
+                "callsign": f"{CALLSIGN_PREFIX}{flight_number}",
                 "on_ground": ac.get("alt_baro") == "ground",
             }
 
@@ -301,7 +321,8 @@ def airborne_flight_numbers(positions_df: pd.DataFrame) -> tuple:
         return tuple()
     numbers = positions_df["callsign"].str[len(CALLSIGN_PREFIX):].str.strip()
     numbers = numbers[numbers.str.len() > 0]
-    return tuple(sorted(numbers.unique()))
+    normalized = {_normalize_flight_number(n) for n in numbers.unique()}
+    return tuple(sorted(normalized))
 
 
 @st.cache_resource
