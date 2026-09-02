@@ -367,38 +367,60 @@ def _cal_request(flight_number: str, dept_date: str) -> list[dict]:
 STALE_LEG_CUTOFF_HOURS = 6  # don't surface a leg further than this from "now" as if it were current
 
 
+_LEG_TERMINAL_STATUSES = {"completed", "landed", "cancelled"}
+
+
 def _pick_current_leg(legs: list[dict], now: datetime) -> dict | None:
+    """Same flight number can have multiple legs the same day (a through-
+    flight, e.g. BW526 POS->GEO then continuing GEO->JFK). Once the first
+    leg completes, the continuation is what's actually relevant -- so a
+    non-terminal leg (still pending/delayed/scheduled) is always preferred
+    over an already-completed one, regardless of which departs earlier.
+    Only when every leg is terminal do we fall back to showing the most
+    recent one, i.e. the flight number's rotation for the day is done.
+    """
     if not legs:
         return None
 
     def dep_time(leg):
         return _parse_iso(leg.get("std_utc"))
 
+    def is_terminal(leg):
+        return (leg.get("flight_status") or "").lower() in _LEG_TERMINAL_STATUSES
+
     airborne = [leg for leg in legs if (leg.get("flight_status") or "").lower() == "airborne"]
     if airborne:
         return airborne[0]
 
-    in_window = []
-    for leg in legs:
-        dep, arr = dep_time(leg), _parse_iso(leg.get("sta_utc"))
-        if dep and arr and dep <= now <= arr + timedelta(hours=2):
-            in_window.append(leg)
-    if in_window:
-        return in_window[0]
-
     cutoff = timedelta(hours=STALE_LEG_CUTOFF_HOURS)
+    non_terminal = [leg for leg in legs if not is_terminal(leg) and dep_time(leg)]
 
-    past = [leg for leg in legs if dep_time(leg) and dep_time(leg) <= now]
-    if past:
-        best_past = max(past, key=dep_time)
-        if now - dep_time(best_past) <= cutoff:
-            return best_past
+    if non_terminal:
+        in_window = []
+        for leg in non_terminal:
+            dep, arr = dep_time(leg), _parse_iso(leg.get("sta_utc"))
+            if dep and arr and dep <= now <= arr + timedelta(hours=2):
+                in_window.append(leg)
+        if in_window:
+            return in_window[0]
 
-    future = [leg for leg in legs if dep_time(leg) and dep_time(leg) > now]
-    if future:
-        soonest_future = min(future, key=dep_time)
-        if dep_time(soonest_future) - now <= cutoff:
-            return soonest_future
+        overdue = [leg for leg in non_terminal if dep_time(leg) <= now]
+        if overdue:
+            most_overdue = max(overdue, key=dep_time)
+            if now - dep_time(most_overdue) <= cutoff:
+                return most_overdue
+
+        upcoming = [leg for leg in non_terminal if dep_time(leg) > now]
+        if upcoming:
+            soonest = min(upcoming, key=dep_time)
+            if dep_time(soonest) - now <= cutoff:
+                return soonest
+
+    terminal_past = [leg for leg in legs if is_terminal(leg) and dep_time(leg) and dep_time(leg) <= now]
+    if terminal_past:
+        most_recent = max(terminal_past, key=dep_time)
+        if now - dep_time(most_recent) <= cutoff:
+            return most_recent
 
     return None
 
