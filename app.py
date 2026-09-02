@@ -19,6 +19,7 @@ from flights import (
     build_flight_table,
     fetch_caribbean_status,
     fetch_live_positions,
+    watchlist_flight_numbers,
 )
 
 REFRESH_SECONDS = 60
@@ -118,7 +119,9 @@ def main():
         st.error(f"Failed to fetch live position data: {exc}")
         positions_df = pd.DataFrame()
 
-    flight_numbers = airborne_flight_numbers(positions_df)
+    flight_numbers = tuple(sorted(
+        set(airborne_flight_numbers(positions_df)) | set(watchlist_flight_numbers())
+    ))
 
     cal_df = pd.DataFrame()
     rate_limited = False

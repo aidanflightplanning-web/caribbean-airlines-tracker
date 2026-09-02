@@ -72,6 +72,28 @@ def _present(value) -> bool:
     return value is not None and pd.notna(value)
 
 
+def get_secret(key: str):
+    """st.secrets raises if no secrets.toml exists at all, even via .get()."""
+    try:
+        return st.secrets.get(key)
+    except Exception:
+        return None
+
+
+def watchlist_flight_numbers() -> tuple:
+    """Flight numbers to always look up via CAL, regardless of whether any
+    ADS-B source currently sees them airborne. No ADS-B feed's coverage is
+    complete, so a flight you specifically care about can otherwise miss a
+    refresh cycle. Configured via the optional WATCHLIST_FLIGHT_NUMBERS
+    secret (comma- or newline-separated, e.g. "526,217,415"). Keep this
+    short — each entry adds a paced ~1.5s CAL request every refresh cycle,
+    on top of whatever's airborne.
+    """
+    raw = get_secret("WATCHLIST_FLIGHT_NUMBERS") or ""
+    numbers = [n.strip() for n in raw.replace("\n", ",").split(",")]
+    return tuple(sorted({n for n in numbers if n}))
+
+
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 

@@ -8,7 +8,7 @@ A large-format Streamlit dashboard for a dispatch office monitor, tracking Carib
 
 | Source | Provides |
 |---|---|
-| [adsb.lol](https://adsb.lol) (falling back to [adsb.fi](https://adsb.fi)) | Live ADS-B position, on-ground status, and *which* BWA flight numbers are currently airborne |
+| [adsb.lol](https://adsb.lol) **and** [adsb.fi](https://adsb.fi) (unioned, not failover) | Live ADS-B position, on-ground status, and *which* BWA flight numbers are currently airborne |
 | Caribbean Airlines' own internal flight-status feed | Scheduled times, actual/estimated departure & arrival (MVT data), flight status, tail number — looked up per flight number |
 
 Neither source alone is enough, so they're merged by callsign/flight number.
@@ -17,17 +17,22 @@ Neither source alone is enough, so they're merged by callsign/flight number.
 
 The first version of this app used [OpenSky Network](https://opensky-network.org/) for live position. That works fine locally, but **fails once deployed to Streamlit Community Cloud** with a connection timeout — OpenSky is known to block/throttle traffic from major cloud-hosting IP ranges (AWS, GCP, etc.) to fight bot abuse, and Community Cloud runs on GCP. (OpenSky has also asked not to be petitioned for "AI dashboard" whitelisting, so that's not a path forward either.)
 
-[adsb.lol](https://adsb.lol) and [adsb.fi](https://adsb.fi) are community-run alternatives built specifically for open, bulk, no-registration consumption, and don't have this problem. They use the same underlying data format (the readsb/tar1090 API family also used by airplanes.live and others), so the swap was a like-for-like replacement. If one of these ever starts blocking cloud traffic too, the fix is the same shape: swap in another provider from that family, or self-host the app outside a major cloud provider's IP ranges.
+[adsb.lol](https://adsb.lol) and [adsb.fi](https://adsb.fi) are community-run alternatives built specifically for open, bulk, no-registration consumption, and don't have this problem. They use the same underlying data format (the readsb/tar1090 API family also used by airplanes.live and others), so the swap was a like-for-like replacement.
 
-### Important limitation: airborne flights only
+**Neither has OpenSky's coverage, though.** Verified by cross-checking live: adsb.lol alone missed real BWA flights that OpenSky picked up, and even querying both adsb.lol *and* adsb.fi together (unioned, currently what the app does) still occasionally misses one that OpenSky has. This is a genuine, unresolved gap in community-run crowdsourced ADS-B coverage versus OpenSky's larger, more established volunteer network — not a bug to "fix," just a real tradeoff of not being able to use OpenSky from this hosting environment. The watchlist below is the direct workaround for any specific flight this matters for.
+
+### Important limitation: airborne (or watchlisted) flights only
 
 Caribbean Airlines' flight-status lookup (`caribbean-airlines.com`'s own "Flight Status" search) is **not a public/documented API** — it's the same internal endpoint their website's flight-status page calls, discovered by inspecting network traffic. It works well for a single flight number, but testing showed it's protected by rate-limiting/WAF: querying it rapidly across many routes to build a full day's schedule got this session's IP blocked with HTTP 429 within seconds.
 
-To stay well under that limit, this app **only looks up flight numbers that are already confirmed airborne** via the ADS-B feed — a small, naturally bounded set (Caribbean Airlines' whole fleet), queried one at a time with a ~1.5s pause between requests. The consequence:
+To stay well under that limit, this app only looks up flight numbers that are **either confirmed airborne via ADS-B, or on your watchlist** — see below — queried one at a time with a ~1.5s pause between requests. The consequence for anything *not* on the watchlist:
 
 - A flight that hasn't pushed back yet is invisible to ADS-B, and therefore to this app, until it's actually in the air. **"Minutes since due to depart" only becomes visible once a flight is airborne** (at which point it's usually near-zero) — it won't warn you about a flight still sitting at the gate.
-- If you need pre-departure delay tracking too, the practical options are: (a) give me a short watchlist of specific flight numbers to also poll proactively (same endpoint, same pacing, just queried unconditionally instead of only-when-airborne), or (b) use a real schedule API (e.g. a free [AviationStack](https://aviationstack.com/) key) instead of/alongside this.
 - Because this hits an undocumented, unofficial endpoint, it can break or get blocked entirely if Caribbean Airlines changes their site — there's no SLA or ToS coverage here. Treat it as best-effort, not a guaranteed feed.
+
+### Watchlist: always check specific flights
+
+Set the `WATCHLIST_FLIGHT_NUMBERS` secret (comma-separated, e.g. `"526,217,415"`, no "BW" prefix) to a short list of flight numbers that should always be checked directly against Caribbean Airlines' status feed — regardless of whether any ADS-B source currently shows them airborne. This is the fix for a specific flight intermittently not showing up: it bypasses ADS-B detection entirely for anything on the list, and as a side benefit also surfaces pre-departure delays for those flights (the one thing airborne-only detection structurally can't do). Keep the list short — each entry is one more paced request every refresh cycle, on top of whatever's airborne.
 
 ## Local setup
 
