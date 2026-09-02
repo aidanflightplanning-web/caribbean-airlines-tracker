@@ -1,19 +1,25 @@
 """Data fetching and merge logic for tracking Caribbean Airlines (BWA) flights.
 
 Two data sources are combined, matched by ICAO callsign:
-  - OpenSky Network: live position, on-ground status, and which BWA flight
-    numbers are currently airborne (no schedule data).
+  - A community ADS-B aggregator (adsb.lol, falling back to adsb.fi): live
+    position, on-ground status, and which BWA flight numbers are currently
+    airborne (no schedule data). OpenSky Network was tried first but its
+    anonymous API blocks/times-out traffic from major cloud-hosting IP
+    ranges (confirmed by testing) — including Streamlit Community Cloud,
+    which runs on GCP — so it's unusable once actually deployed there.
+    adsb.lol/adsb.fi are community projects built for exactly this kind of
+    open, bulk, no-registration consumption and don't have that problem.
   - Caribbean Airlines' own internal flight-status endpoint (undocumented,
     used by caribbean-airlines.com's own "Flight Status" page): scheduled
     times, actual/estimated departure & arrival, and flight status, looked
     up per flight number.
 
-This app only queries CAL's endpoint for flight numbers OpenSky has already
-confirmed are airborne. That endpoint is rate-limited/WAF-protected (found
-by testing: bulk/rapid querying returns HTTP 429), so it is NOT safe to
-scan the full route network to build a complete schedule — only a small,
-paced, per-flight lookup is used. Consequence: a flight that hasn't
-departed yet (not visible on ADS-B) won't appear here until wheels-up.
+This app only queries CAL's endpoint for flight numbers already confirmed
+airborne. That endpoint is rate-limited/WAF-protected (found by testing:
+bulk/rapid querying returns HTTP 429), so it is NOT safe to scan the full
+route network to build a complete schedule — only a small, paced,
+per-flight lookup is used. Consequence: a flight that hasn't departed yet
+(not visible on ADS-B) won't appear here until wheels-up.
 """
 
 import time
@@ -23,8 +29,20 @@ import pandas as pd
 import requests
 import streamlit as st
 
-OPENSKY_STATES_URL = "https://opensky-network.org/api/states/all"
 CAL_STATUS_URL = "https://www.caribbean-airlines.com/get/Flight/Status"
+
+# Point+radius queries against community ADS-B aggregators (readsb/tar1090
+# API family). Centered on Piarco (POS), Caribbean Airlines' main hub, with
+# a radius wide enough to cover the whole route network including the
+# farthest destination (Paris ORY, ~3,670 nm away). Tried in order; falls
+# back to the next source if one is unreachable or errors.
+ADSB_SOURCES = [
+    "https://api.adsb.lol/v2/point/{lat}/{lon}/{radius}",
+    "https://opendata.adsb.fi/api/v2/point/{lat}/{lon}/{radius}",
+]
+ADSB_QUERY_LAT = 10.5954
+ADSB_QUERY_LON = -61.3372
+ADSB_QUERY_RADIUS_NM = 4000
 
 CALLSIGN_PREFIX = "BWA"  # Caribbean Airlines ICAO code
 OVERDUE_THRESHOLD_MINUTES = 30
@@ -36,13 +54,6 @@ CAL_HEADERS = {
                   "(KHTML, like Gecko) Chrome/120.0 Safari/537.36",
     "Referer": "https://www.caribbean-airlines.com/",
 }
-
-OPENSKY_STATE_COLUMNS = [
-    "icao24", "callsign", "origin_country", "time_position", "last_contact",
-    "longitude", "latitude", "baro_altitude", "on_ground", "velocity",
-    "true_track", "vertical_rate", "sensors", "geo_altitude", "squawk",
-    "spi", "position_source",
-]
 
 CAL_STATUS_MAP = {
     "airborne": "active",
@@ -61,14 +72,6 @@ def _present(value) -> bool:
     return value is not None and pd.notna(value)
 
 
-def get_secret(key: str):
-    """st.secrets raises if no secrets.toml exists at all, even via .get()."""
-    try:
-        return st.secrets.get(key)
-    except Exception:
-        return None
-
-
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -83,31 +86,39 @@ def _parse_iso(value):
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def fetch_opensky_states() -> pd.DataFrame:
-    """Live ADS-B state vectors for aircraft currently squawking a BWA callsign."""
-    auth = None
-    username = get_secret("OPENSKY_USERNAME")
-    password = get_secret("OPENSKY_PASSWORD")
-    if username and password:
-        auth = (username, password)
+def fetch_live_positions() -> pd.DataFrame:
+    """Live position/on-ground status for aircraft currently squawking a BWA
+    callsign, via a community ADS-B aggregator (adsb.lol, then adsb.fi)."""
+    last_exc = None
+    for template in ADSB_SOURCES:
+        url = template.format(lat=ADSB_QUERY_LAT, lon=ADSB_QUERY_LON, radius=ADSB_QUERY_RADIUS_NM)
+        try:
+            resp = requests.get(url, timeout=20)
+            resp.raise_for_status()
+            payload = resp.json()
+        except Exception as exc:
+            last_exc = exc
+            continue
 
-    resp = requests.get(OPENSKY_STATES_URL, auth=auth, timeout=20)
-    resp.raise_for_status()
-    payload = resp.json()
-    states = payload.get("states") or []
+        rows = []
+        for ac in payload.get("ac") or []:
+            callsign = (ac.get("flight") or "").strip()
+            if not callsign.startswith(CALLSIGN_PREFIX):
+                continue
+            rows.append({
+                "icao24": ac.get("hex"),
+                "callsign": callsign,
+                "on_ground": ac.get("alt_baro") == "ground",
+            })
+        return pd.DataFrame(rows, columns=["icao24", "callsign", "on_ground"])
 
-    df = pd.DataFrame(states, columns=OPENSKY_STATE_COLUMNS)
-    if df.empty:
-        return df
-
-    df["callsign"] = df["callsign"].fillna("").str.strip()
-    return df[df["callsign"].str.startswith(CALLSIGN_PREFIX)].reset_index(drop=True)
+    raise last_exc
 
 
-def airborne_flight_numbers(opensky_df: pd.DataFrame) -> tuple:
-    if opensky_df.empty:
+def airborne_flight_numbers(positions_df: pd.DataFrame) -> tuple:
+    if positions_df.empty:
         return tuple()
-    numbers = opensky_df["callsign"].str[len(CALLSIGN_PREFIX):].str.strip()
+    numbers = positions_df["callsign"].str[len(CALLSIGN_PREFIX):].str.strip()
     numbers = numbers[numbers.str.len() > 0]
     return tuple(sorted(numbers.unique()))
 
@@ -273,17 +284,17 @@ def _is_overdue(row) -> bool:
     return (_now_utc() - eta).total_seconds() / 60 > OVERDUE_THRESHOLD_MINUTES
 
 
-def build_flight_table(opensky_df: pd.DataFrame, cal_df: pd.DataFrame) -> pd.DataFrame:
+def build_flight_table(positions_df: pd.DataFrame, cal_df: pd.DataFrame) -> pd.DataFrame:
     """Merge live position data with CAL schedule/status data by callsign."""
     if cal_df.empty:
-        merged = opensky_df.copy()
+        merged = positions_df.copy()
         for col in ["flight_iata", "flight_status", "dep_airport", "dep_iata",
                      "dep_scheduled", "dep_estimated", "dep_actual",
                      "arr_airport", "arr_iata", "arr_scheduled", "arr_estimated",
                      "arr_actual", "aircraft_type", "tailnumber"]:
             merged[col] = None
     else:
-        merged = pd.merge(cal_df, opensky_df, on="callsign", how="outer")
+        merged = pd.merge(cal_df, positions_df, on="callsign", how="outer")
 
     if merged.empty:
         return merged

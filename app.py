@@ -1,11 +1,11 @@
 """Caribbean Airlines (BWA) flight tracker — dedicated dispatch-office display.
 
-Combines live ADS-B data (OpenSky Network) with Caribbean Airlines' own
-flight-status data (looked up per airborne flight number) into a single
-large-format table meant for an unattended wall/office monitor. Auto-
-refreshes the page every 60 seconds. See flights.py for why this only
-covers flights that have already departed (OpenSky-discoverable), not
-the full day's schedule.
+Combines live ADS-B data (community aggregator: adsb.lol/adsb.fi) with
+Caribbean Airlines' own flight-status data (looked up per airborne flight
+number) into a single large-format table meant for an unattended wall/
+office monitor. Auto-refreshes the page every 60 seconds. See flights.py
+for why this only covers flights that have already departed (ADS-B
+discoverable), not the full day's schedule.
 """
 
 import html
@@ -18,7 +18,7 @@ from flights import (
     airborne_flight_numbers,
     build_flight_table,
     fetch_caribbean_status,
-    fetch_opensky_states,
+    fetch_live_positions,
 )
 
 REFRESH_SECONDS = 60
@@ -107,18 +107,18 @@ def main():
 
     st.title("✈️ Caribbean Airlines Flight Tracker")
     st.markdown(
-        '<div class="subtitle">Callsign BWA · Live position via OpenSky Network · '
+        '<div class="subtitle">Callsign BWA · Live position via community ADS-B feed · '
         "Schedule/status via Caribbean Airlines</div>",
         unsafe_allow_html=True,
     )
 
     try:
-        opensky_df = fetch_opensky_states()
+        positions_df = fetch_live_positions()
     except Exception as exc:
-        st.error(f"Failed to fetch OpenSky data: {exc}")
-        opensky_df = pd.DataFrame()
+        st.error(f"Failed to fetch live position data: {exc}")
+        positions_df = pd.DataFrame()
 
-    flight_numbers = airborne_flight_numbers(opensky_df)
+    flight_numbers = airborne_flight_numbers(positions_df)
 
     cal_df = pd.DataFrame()
     rate_limited = False
@@ -134,7 +134,7 @@ def main():
             "the next automatic refresh."
         )
 
-    table = build_flight_table(opensky_df, cal_df)
+    table = build_flight_table(positions_df, cal_df)
 
     if table.empty:
         st.info("No BWA flights currently airborne.")
