@@ -461,13 +461,33 @@ def _pick_current_leg(legs: list[dict], now: datetime) -> dict | None:
 
 @st.cache_data(ttl=CAL_CACHE_TTL_SECONDS, show_spinner=False)
 def _fetch_single_flight_legs(flight_number: str) -> list[dict]:
+    """Query CAL under both today's and yesterday's dept_date and combine
+    whatever legs either returns, rather than stopping at the first date
+    that returns anything.
+
+    CAL's own date-indexing doesn't line up with "today vs. yesterday" the
+    way it sounds -- confirmed by testing: for a real, currently-airborne
+    flight, querying with today's date returned only a far-future
+    "Scheduled" leg (tomorrow's rotation), while the actual "Airborne" leg
+    only appeared under yesterday's date. Stopping at the first non-empty
+    date meant _pick_current_leg never even saw the real airborne leg,
+    and picked nothing (correctly rejecting the too-far-future one),
+    surfacing as a spurious "Unknown" row despite CAL genuinely having the
+    live data one query away.
+    """
     now = _now_utc()
     dates_to_try = [now.strftime("%Y%m%d"), (now - timedelta(days=1)).strftime("%Y%m%d")]
+    seen_ids = set()
+    combined = []
     for dept_date in dates_to_try:
-        legs = _cal_request(flight_number, dept_date)
-        if legs:
-            return legs
-    return []
+        for leg in _cal_request(flight_number, dept_date):
+            leg_id = leg.get("id")
+            if leg_id is not None and leg_id in seen_ids:
+                continue
+            if leg_id is not None:
+                seen_ids.add(leg_id)
+            combined.append(leg)
+    return combined
 
 
 @st.cache_resource
@@ -638,6 +658,15 @@ def build_flight_table(positions_df: pd.DataFrame, cal_df: pd.DataFrame) -> pd.D
     else:
         merged = pd.merge(cal_df, positions_df, on="callsign", how="outer")
 
+    if merged.empty:
+        return merged
+
+    # Drop position-only rows: ADS-B detected a BWA callsign, but CAL has
+    # no matching record for it at all (either genuinely not a recognized
+    # CAL flight number, or no leg fell within a relevant time window).
+    # Showing "Unknown, ? -> ?" with no route/schedule info isn't useful on
+    # a dispatch board and reads as broken rather than informative.
+    merged = merged[merged["flight_iata"].notna()].reset_index(drop=True)
     if merged.empty:
         return merged
 
