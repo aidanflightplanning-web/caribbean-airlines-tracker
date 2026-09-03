@@ -316,9 +316,23 @@ def fetch_live_positions() -> pd.DataFrame:
 
 
 def airborne_flight_numbers(positions_df: pd.DataFrame) -> tuple:
+    """Flight numbers to add as candidates purely from ADS-B, restricted to
+    aircraft actually in the air (on_ground == False). A parked aircraft
+    between rotations can keep broadcasting ADS-B for hours (e.g. sitting
+    overnight at the destination waiting for tomorrow's flight) -- without
+    this filter, that gets treated as a "detected" flight even though its
+    next real departure might be many hours away, past the staleness
+    cutoff CAL lookups use, producing a bare position-only "Unknown" row
+    that adds noise rather than useful information. On-ground aircraft
+    that genuinely matter (e.g. taxiing for imminent departure) are still
+    found via the schedule-based discovery window, which is time-aware.
+    """
     if positions_df.empty:
         return tuple()
-    numbers = positions_df["callsign"].str[len(CALLSIGN_PREFIX):].str.strip()
+    airborne = positions_df[positions_df["on_ground"] == False]  # noqa: E712
+    if airborne.empty:
+        return tuple()
+    numbers = airborne["callsign"].str[len(CALLSIGN_PREFIX):].str.strip()
     numbers = numbers[numbers.str.len() > 0]
     normalized = {_normalize_flight_number(n) for n in numbers.unique()}
     return tuple(sorted(normalized))
