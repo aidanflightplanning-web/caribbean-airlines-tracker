@@ -1,6 +1,6 @@
 # Caribbean Airlines Flight Tracker
 
-A Streamlit dashboard for a dispatch office monitor, tracking Caribbean Airlines flights (ICAO callsign `BWA`). Shows flight status, scheduled departure time, minutes elapsed since a delayed flight was due to depart, how many minutes late a flight actually pushed back, and ETA — with a warning banner for diverting aircraft. Auto-refreshes every 10 minutes; no interaction needed once it's up on the monitor. Sized in viewport-relative units so the whole board fits on one screen without scrolling, regardless of the monitor's actual resolution.
+A Streamlit dashboard for a dispatch office monitor, tracking Caribbean Airlines flights (ICAO callsign `BWA`). Shows flight status, scheduled departure time, minutes elapsed since a delayed flight was due to depart, how many minutes late a flight actually pushed back, and ETA — with a warning banner for diverting aircraft. Auto-refreshes every 5 minutes; no interaction needed once it's up on the monitor. Sized in viewport-relative units so the whole board fits on one screen without scrolling, regardless of the monitor's actual resolution.
 
 **No API key or account required.**
 
@@ -42,7 +42,7 @@ Early versions of this app re-derived "which flights to show" from scratch every
 
 Several fixes address this:
 - **Schedule-based discovery** (above) is the main one — it makes the candidate set mostly stable cycle to cycle, since it's driven by a published timetable rather than moment-to-moment detection.
-- **Per-flight caching**: each flight number's Caribbean Airlines status is cached independently, for 20 minutes — deliberately *longer* than the 10-minute refresh interval, so cache entries expire on a rolling basis rather than all at once forcing a full-batch re-fetch (and, with ~15-20 candidates typical once schedule-based discovery is active, a full-batch re-fetch every cycle is exactly what tripped CAL's rate limiter in testing).
+- **Per-flight caching**: each flight number's Caribbean Airlines status is cached independently, for 20 minutes — deliberately *longer* than the 5-minute refresh interval, so cache entries expire on a rolling basis rather than all at once forcing a full-batch re-fetch (and, with ~15-20 candidates typical once schedule-based discovery is active, a full-batch re-fetch every cycle is exactly what tripped CAL's rate limiter in testing).
 - **Shuffled fetch order**: only lookups that need a real network call (not already cached) get shuffled before pacing through them, so if the rate limiter does trip partway through, it doesn't deterministically cut off the same flights every cycle (sorted order would otherwise always sacrifice the same ones).
 - **A staleness cutoff**: if the only Caribbean Airlines record found for a flight number is from more than 6 hours away from now (past or future), it's treated as no current data rather than displayed as if relevant — this prevents a long-cancelled or long-past flight from cluttering the board with misleading figures like "978 min since due."
 - **Sticky tracking**: once a flight is confirmed active, it stays in the "keep checking this" set for 20 minutes after its last confirmation, even if a later cycle's discovery misses it — so a brief gap doesn't drop it off the display. It's removed promptly once CAL confirms the flight has landed or been cancelled, not just after the grace period expires.
@@ -77,7 +77,7 @@ No secrets needed. (`.streamlit/secrets.toml.example` is kept as a placeholder i
 2. Go to [share.streamlit.io](https://share.streamlit.io), sign in with GitHub, and click **New app**.
 3. Point it at your repo, branch `main`, main file `app.py`.
 4. Deploy. The app auto-redeploys on every push to `main`.
-5. Open the deployed URL full-screen on the office monitor — it refreshes itself every 10 minutes, no interaction needed.
+5. Open the deployed URL full-screen on the office monitor — it refreshes itself every 5 minutes, no interaction needed.
 
 ## Notes / known limitations
 

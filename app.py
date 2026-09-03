@@ -25,7 +25,7 @@ from flights import (
     watchlist_flight_numbers,
 )
 
-REFRESH_SECONDS = 600
+REFRESH_SECONDS = 300
 
 st.set_page_config(page_title="Caribbean Airlines Flight Tracker", page_icon="✈️", layout="wide")
 
